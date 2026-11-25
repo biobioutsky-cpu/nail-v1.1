@@ -1,0 +1,67 @@
+$ErrorActionPreference = "Stop"
+
+if (-not (Test-Path ".\dist\nail.ps1")) {
+    Write-Host "[ERR] Missing .\dist\nail.ps1. Run from your nail-v1.1 repository root." -ForegroundColor DarkGray
+    exit 1
+}
+
+# 1. Keep local state, backups, and saved threads out of git
+$IgnoreEntries = @(
+    "dist/backups/",
+    "dist/browser_state.json",
+    "dist/boards.json",
+    "dist/ledger.json",
+    "dist/saved_threads/",
+    "dist/feeds/"
+)
+if (-not (Test-Path ".\.gitignore")) { New-Item -ItemType File -Path ".\.gitignore" -Force | Out-Null }
+$CurrentIgnore = Get-Content ".\.gitignore" -ErrorAction SilentlyContinue
+foreach ($entry in $IgnoreEntries) {
+    if ($CurrentIgnore -notcontains $entry) {
+        Add-Content -Path ".\.gitignore" -Value $entry
+    }
+}
+
+# 2. Install/import ps2exe and compile dist\nail.ps1 -> dist\nail.exe
+if (-not (Get-Module -ListAvailable -Name ps2exe)) {
+    Write-Host "[...] Installing ps2exe module..." -ForegroundColor DarkGray
+    Install-Module -Name ps2exe -Scope CurrentUser -Force
+}
+Import-Module ps2exe
+
+if (Test-Path ".\dist\nail.exe") { Remove-Item ".\dist\nail.exe" -Force }
+
+Write-Host "[...] Compiling .\dist\nail.ps1 -> .\dist\nail.exe..." -ForegroundColor DarkGray
+Invoke-ps2exe `
+    -inputFile ".\dist\nail.ps1" `
+    -outputFile ".\dist\nail.exe" `
+    -title "NAIL v1.1 // LAINCHAIN CLI" `
+    -description "Text-Based Lainchan Terminal Browser (/tech base -> /mega bridge)" `
+    -company "xuro" `
+    -product "NAIL-V1.1" `
+    -version "1.1.0.0" `
+    -noConsole:$false `
+    -noError `
+    -requireAdmin:$false
+
+if (-not (Test-Path ".\dist\nail.exe")) {
+    Write-Host "[ERR] Compilation failed: .\dist\nail.exe was not created." -ForegroundColor DarkGray
+    exit 1
+}
+
+# 3. Write clean README.md matching the bare /tech -> /mega browser
+@'
+# NAIL v1.1 // LAINCHAIN TEXT BROWSER
+
+Monochrome, standalone Windows terminal browser anchored in `/tech/` with direct `/mega/` bridge access, visit-ranked top boards, local thread archiving, and 1-reply-per-thread posting as `nailuser`.
+
+---
+
+### Run
+
+```powershell
+# Run standalone executable
+.\dist\nail.exe
+
+# Or run PowerShell source directly
+powershell -ExecutionPolicy Bypass -NoProfile -File .\dist\nail.ps1
