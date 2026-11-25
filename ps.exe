@@ -1,0 +1,483 @@
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+New-Item -ItemType Directory -Path ".\dist" -Force | Out-Null
+
+# 1. Backup existing dist\nail.ps1 before modifying
+if (Test-Path ".\dist\nail.ps1") {
+    $BackupDir = ".\dist\backups"
+    New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+    $Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $BackupFile = Join-Path $BackupDir "nail_$Stamp.ps1.bak"
+    Copy-Item -Path ".\dist\nail.ps1" -Destination $BackupFile -Force
+    Write-Host "[BACKUP] Saved previous script to $BackupFile" -ForegroundColor Gray
+}
+
+@'
+# NAIL v1.1 // LAINCHAIN TEXT BROWSER (BASE: /tech // BRIDGE: /mega)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$BaseDir     = if ($PSScriptRoot) { $PSScriptRoot } else { [AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') }
+$StateFile   = Join-Path $BaseDir "browser_state.json"
+$SaveDir     = Join-Path $BaseDir "saved_threads"
+$HostUrl     = "https://lainchan.org"
+$BaseBoard   = "tech"
+$BridgeBoard = "mega"
+$PostHandle  = "nailuser"
+$Headers     = @{
+    "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "Accept"     = "application/json, text/html;q=0.9, */*;q=0.8"
+}
+
+function Load-State {
+    if (Test-Path $StateFile) {
+        try {
+            $data = Get-Content $StateFile -Raw | ConvertFrom-Json
+            if (-not $data.PSObject.Properties['replied_threads']) {
+                $data | Add-Member -NotePropertyName "replied_threads" -NotePropertyValue @()
+            }
+            return $data
+        } catch {}
+    }
+    $init = [PSCustomObject]@{
+        handle          = "xuro"
+        active_board    = $BaseBoard
+        visits          = [PSCustomObject]@{ "tech" = 1; "mega" = 0 }
+        replied_threads = @()
+    }
+    $init | ConvertTo-Json -Depth 4 | Set-Content $StateFile -Encoding UTF8
+    return $init
+}
+
+function Save-State($State) {
+    $State | ConvertTo-Json -Depth 4 | Set-Content $StateFile -Encoding UTF8
+}
+
+function Add-Visit($State, [string]$Board) {
+    if ($State.visits.PSObject.Properties[$Board]) {
+        $State.visits.$Board = [int]$State.visits.$Board + 1
+    } else {
+        $State.visits | Add-Member -NotePropertyName $Board -NotePropertyValue 1
+    }
+    Save-State $State
+}
+
+function Get-TopBoards($State, [int]$Limit = 4) {
+    $list = foreach ($p in $State.visits.PSObject.Properties) {
+        [PSCustomObject]@{ name = $p.Name; hits = [int]$p.Value }
+    }
+    return @($list | Sort-Object -Property hits -Descending | Select-Object -First $Limit)
+}
+
+function Clean-Html([string]$Raw) {
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return "" }
+    $t = $Raw -replace '<br\s*/?>', "`n"
+    $t = $t -replace '</p>', "`n"
+    $t = $t -replace '<[^>]+>', ''
+    $t = [System.Net.WebUtility]::HtmlDecode($t)
+    return $t.Trim()
+}
+
+function Show-Header($State, [int]$StackDepth = 0) {
+    Clear-Host
+    $topStr = ((Get-TopBoards $State 4) | ForEach-Object { "/$($_.name)/($($_.hits))" }) -join " "
+    Write-Host "==========================================================================" -ForegroundColor DarkGray
+    Write-Host " [NAIL-V1.1 // /tech BASE -> /mega BRIDGE]  USER: $($State.handle) | POST-AS: $PostHandle" -ForegroundColor Gray
+    Write-Host " ACTIVE: [/$($State.active_board)/] | TOP: $topStr | HISTORY: $StackDepth" -ForegroundColor White
+    Write-Host "==========================================================================" -ForegroundColor DarkGray
+    Write-Host " Commands:" -ForegroundColor DarkGray
+    Write-Host "   read <no|idx> | <no>        Read full thread & replies" -ForegroundColor Gray
+    Write-Host "   reply <text>                Post 1 reply as '$PostHandle' & auto <<back" -ForegroundColor Gray
+    Write-Host "   back | <<back               Return to previous catalog or thread" -ForegroundColor Gray
+    Write-Host "   index | mega [no] | tech | use <board> | boards | top | save | exit`n" -ForegroundColor Gray
+}
+
+function Show-Boards($State) {
+    Write-Host "[...] Fetching lainchan board directory..." -ForegroundColor DarkGray
+    try {
+        $resp = Invoke-WebRequest -Uri "$HostUrl/boards.json" -Headers $Headers -UseBasicParsing -TimeoutSec 12
+        $all  = $resp.Content | ConvertFrom-Json
+        Write-Host "--------------------------------------------------------------------------" -ForegroundColor DarkGray
+        Write-Host (" {0,-12} {1,-26} {2}" -f "BOARD", "TITLE", "SUBTITLE") -ForegroundColor Gray
+        Write-Host "--------------------------------------------------------------------------" -ForegroundColor DarkGray
+        foreach ($b in $all) {
+            $mark = if ($b.uri -eq $State.active_board) { "*" } else { " " }
+            $sub  = if ($b.PSObject.Properties['subtitle'] -and $b.subtitle) { $b.subtitle } else { "" }
+            $subShort = $sub.Substring(0, [math]::Min(32, $sub.Length))
+            Write-Host ("{0}/{1,-10} {2,-26} {3}" -f $mark, "$($b.uri)/", $b.title, $subShort) -ForegroundColor White
+        }
+        Write-Host "--------------------------------------------------------------------------" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "[ERR] Could not reach $HostUrl/boards.json : $($_.Exception.Message)" -ForegroundColor DarkGray
+    }
+}
+
+function Show-Catalog([string]$Board) {
+    Write-Host "[...] Loading /$Board/ catalog..." -ForegroundColor DarkGray
+    try {
+        $resp  = Invoke-WebRequest -Uri "$HostUrl/$Board/catalog.json" -Headers $Headers -UseBasicParsing -TimeoutSec 12
+        $pages = $resp.Content | ConvertFrom-Json
+        $threads = @()
+        foreach ($p in $pages) {
+            if ($p.PSObject.Properties['threads'] -and $p.threads) { $threads += $p.threads }
+        }
+
+        Write-Host "--------------------------------------------------------------------------" -ForegroundColor DarkGray
+        Write-Host (" [/{0}/ CATALOG]  {1,-4} {2,-10} {3,-5} {4}" -f $Board.ToUpper(), "IDX", "NO.", "RPL", "SUBJECT / EXCERPT") -ForegroundColor Gray
+        Write-Host "--------------------------------------------------------------------------" -ForegroundColor DarkGray
+
+        $top = @($threads | Select-Object -First 20)
+        $rowIdx = 1
+        foreach ($t in $top) {
+            $subj = if ($t.PSObject.Properties['sub']) { Clean-Html $t.sub } else { "" }
+            $body = if ($t.PSObject.Properties['com']) { (Clean-Html $t.com) -replace '\s+', ' ' } else { "" }
+            $line = if ($subj) { "[$subj] $body" } else { $body }
+            if ([string]::IsNullOrWhiteSpace($line)) { $line = "(file-only post)" }
+            $lineShort = $line.Substring(0, [math]::Min(47, $line.Length))
+            $rpl = if ($t.PSObject.Properties['replies'] -and $null -ne $t.replies) { $t.replies } else { 0 }
+            Write-Host (" [{0,2}] #{1,-9} {2,-5} {3}" -f $rowIdx, $t.no, $rpl, $lineShort) -ForegroundColor White
+            $rowIdx++
+        }
+        Write-Host "--------------------------------------------------------------------------" -ForegroundColor DarkGray
+        Write-Host " Type 'read 1' (IDX) or 'read <NO.>' to open thread, or 'mega' for /mega/." -ForegroundColor DarkGray
+        return $top
+    } catch {
+        Write-Host "[ERR] Failed to load /$Board/ catalog : $($_.Exception.Message)" -ForegroundColor DarkGray
+        return @()
+    }
+}
+
+function Parse-ThreadHtml([string]$Html, [string]$Board, [string]$ThreadNo) {
+    $parsed = @()
+    $blocks = [regex]::Matches($Html, '<div class="post (?:op|reply)" id="post_\d+"[\s\S]*?(?=<div class="post (?:op|reply)" id="post_\d+"|<div id="thread-interactions"|<hr\s*/?>)')
+    foreach ($m in $blocks) {
+        $chunk   = $m.Value
+        $noVal   = if ($chunk -match 'id="post_(\d+)"') { $Matches[1] } else { $ThreadNo }
+        $nameVal = if ($chunk -match '<span class="name">([^<]+)</span>') { Clean-Html $Matches[1] } else { "Anonymous" }
+        $subVal  = if ($chunk -match '<span class="subject">([^<]+)</span>') { Clean-Html $Matches[1] } else { "" }
+        $bodyVal = if ($chunk -match '<div class="body">([\s\S]*?)</div>') { Clean-Html $Matches[1] } else { "" }
+        $parsed += [PSCustomObject]@{
+            no       = $noVal
+            name     = $nameVal
+            trip     = ""
+            time     = $null
+            sub      = $subVal
+            com      = $bodyVal
+            filename = $null
+            ext      = ""
+        }
+    }
+    return $parsed
+}
+
+function Read-Thread([string]$Board, [string]$TargetInput, $CatalogCache, $State) {
+    $cleanInput = ($TargetInput -replace '^#', '').Trim()
+    $threadNo = $cleanInput
+
+    if ($cleanInput -match '^\d+$' -and [int]$cleanInput -ge 1 -and [int]$cleanInput -le $CatalogCache.Count -and $CatalogCache.Count -gt 0) {
+        $threadNo = "$($CatalogCache[[int]$cleanInput - 1].no)"
+    }
+
+    $jsonUrl = "$HostUrl/$Board/res/$threadNo.json"
+    $htmlUrl = "$HostUrl/$Board/res/$threadNo.html"
+    Write-Host "[...] Reading /$Board/ thread #$threadNo..." -ForegroundColor DarkGray
+
+    $posts = @()
+    try {
+        $rawResp = Invoke-WebRequest -Uri $jsonUrl -Headers $Headers -UseBasicParsing -TimeoutSec 15
+        $res     = $rawResp.Content | ConvertFrom-Json
+        if ($res.PSObject.Properties['posts'] -and $res.posts) {
+            $posts = @($res.posts)
+        } elseif ($res -is [System.Array]) {
+            $posts = @($res)
+        }
+    } catch {
+        Write-Host "[...] JSON endpoint unavailable ($($_.Exception.Message)), falling back to HTML..." -ForegroundColor DarkGray
+    }
+
+    if ($posts.Count -eq 0) {
+        try {
+            $htmlResp = Invoke-WebRequest -Uri $htmlUrl -Headers $Headers -UseBasicParsing -TimeoutSec 15
+            $posts = @(Parse-ThreadHtml -Html $htmlResp.Content -Board $Board -ThreadNo $threadNo)
+        } catch {
+            Write-Host "[ERR] Could not open /$Board/ thread #$threadNo : $($_.Exception.Message)" -ForegroundColor DarkGray
+            return $null
+        }
+    }
+
+    if ($posts.Count -eq 0) {
+        Write-Host "[ERR] Thread #$threadNo returned 0 readable posts." -ForegroundColor DarkGray
+        return $null
+    }
+
+    $threadKey = "$Board/$threadNo"
+    $alreadyReplied = ($State.replied_threads -contains $threadKey)
+    $slotMsg = if ($alreadyReplied) { "0/1 REPLY SLOT USED (LOCKED)" } else { "1/1 REPLY SLOT OPEN (type: reply <msg>)" }
+
+    Write-Host "==========================================================================" -ForegroundColor DarkGray
+    Write-Host " [THREAD /$Board/#$threadNo // $($posts.Count) POSTS // AS: $PostHandle]" -ForegroundColor White
+    Write-Host " [QUOTA] $slotMsg" -ForegroundColor Gray
+    Write-Host "==========================================================================" -ForegroundColor DarkGray
+
+    $idx = 0
+    foreach ($p in $posts) {
+        $tag  = if ($idx -eq 0) { "OP" } else { "RPL #$idx" }
+        $name = if ($p.PSObject.Properties['name'] -and $p.name) { $p.name } else { "Anonymous" }
+        $trip = if ($p.PSObject.Properties['trip'] -and $p.trip) { $p.trip } else { "" }
+        $dt   = if ($p.PSObject.Properties['time'] -and $p.time) {
+            [DateTimeOffset]::FromUnixTimeSeconds([long]$p.time).ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+        } else { "" }
+        $subj = if ($p.PSObject.Properties['sub']) { Clean-Html $p.sub } else { "" }
+
+        $hdr = "[$tag] >>#$($p.no) | $name$trip | $dt"
+        if ($subj) { $hdr += " | [$subj]" }
+        Write-Host $hdr -ForegroundColor Gray
+
+        if ($p.PSObject.Properties['filename'] -and $p.filename) {
+            $ext = if ($p.PSObject.Properties['ext']) { $p.ext } else { "" }
+            $dim = if ($p.PSObject.Properties['w'] -and $p.PSObject.Properties['h']) { " ($($p.w)x$($p.h))" } else { "" }
+            Write-Host "   [FILE: $($p.filename)$ext$dim]" -ForegroundColor DarkGray
+        }
+
+        $body = if ($p.PSObject.Properties['com']) { Clean-Html $p.com } else { "" }
+        if ($body) {
+            $body -split "`n" | ForEach-Object {
+                if ($_ -match '^>') {
+                    Write-Host "   $_" -ForegroundColor Gray
+                } else {
+                    Write-Host "   $_" -ForegroundColor White
+                }
+            }
+        }
+        Write-Host "--------------------------------------------------------------------------" -ForegroundColor DarkGray
+        $idx++
+    }
+
+    Write-Host " [END THREAD // 'reply <msg>' (1 max, auto <<back) or '<<back']" -ForegroundColor DarkGray
+    return [PSCustomObject]@{ board = $Board; no = $threadNo; posts = $posts }
+}
+
+function Send-ThreadReply([string]$Board, [string]$ThreadNo, [string]$CommentText, $State) {
+    $threadKey = "$Board/$ThreadNo"
+    if ($State.replied_threads -contains $threadKey) {
+        Write-Host "[BLOCKED] 1-reply limit reached for /$threadKey (already posted as $PostHandle)." -ForegroundColor DarkGray
+        return $false
+    }
+
+    $threadUrl = "$HostUrl/$Board/res/$ThreadNo.html"
+    $postUrl   = "$HostUrl/post.php"
+    Write-Host "[...] Preparing reply to /$threadKey as '$PostHandle'..." -ForegroundColor DarkGray
+
+    try {
+        $sess = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+        $page = Invoke-WebRequest -Uri $threadUrl -Headers $Headers -WebSession $sess -UseBasicParsing -TimeoutSec 15
+
+        $formFields = @{
+            board    = $Board
+            thread   = $ThreadNo
+            name     = $PostHandle
+            email    = ""
+            subject  = ""
+            body     = $CommentText
+            post     = "New Reply"
+            password = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object { [char]$_ })
+        }
+
+        # Extract any hidden anti-spam/token inputs from the thread form
+        $hiddenMatches = [regex]::Matches($page.Content, '<input[^>]+type=["'']hidden["''][^>]*>')
+        foreach ($hm in $hiddenMatches) {
+            $tagHtml = $hm.Value
+            if ($tagHtml -match 'name=["'']([^"'']+)["'']') {
+                $fName = $Matches[1]
+                $fVal  = if ($tagHtml -match 'value=["'']([^"'']*)["'']') { [System.Net.WebUtility]::HtmlDecode($Matches[1]) } else { "" }
+                if (-not $formFields.ContainsKey($fName)) {
+                    $formFields[$fName] = $fVal
+                }
+            }
+        }
+
+        $postHeaders = $Headers.Clone()
+        $postHeaders["Referer"] = $threadUrl
+        $postHeaders["Origin"]  = $HostUrl
+
+        $resp = Invoke-WebRequest -Uri $postUrl -Method Post -Headers $postHeaders -WebSession $sess -Body $formFields -UseBasicParsing -TimeoutSec 15
+        $cleanResp = Clean-Html $resp.Content
+
+        if ($cleanResp -match '(?i)error|banned|captcha|flood|wait|invalid|blocked|spam') {
+            $errLine = ($cleanResp -split "`n" | Where-Object { $_ -match '(?i)error|banned|captcha|flood|wait|invalid|blocked|spam' } | Select-Object -First 1)
+            Write-Host "[POST REJECTED] $errLine" -ForegroundColor DarkGray
+            return $false
+        }
+
+        $State.replied_threads = @($State.replied_threads) + $threadKey
+        Save-State $State
+        Write-Host "[POSTED] Reply sent to /$threadKey as '$PostHandle'. Executing auto <<back..." -ForegroundColor White
+        Start-Sleep -Milliseconds 900
+        return $true
+    } catch {
+        Write-Host "[ERR] Reply failed on /$threadKey : $($_.Exception.Message)" -ForegroundColor DarkGray
+        return $false
+    }
+}
+
+$State = Load-State
+$State.active_board = $BaseBoard
+Add-Visit $State $BaseBoard
+$HistoryStack = New-Object System.Collections.Generic.List[PSObject]
+$LastThread   = $null
+
+Show-Header $State $HistoryStack.Count
+$CatalogCache = Show-Catalog $BaseBoard
+$CurrentView  = [PSCustomObject]@{ type = "catalog"; board = $BaseBoard; no = $null }
+
+function Invoke-NavigateBack {
+    if ($script:HistoryStack.Count -eq 0) {
+        Write-Host "[<<BACK] Returning to /$($script:State.active_board)/ catalog..." -ForegroundColor DarkGray
+        $script:CatalogCache = Show-Catalog $script:State.active_board
+        $script:CurrentView  = [PSCustomObject]@{ type = "catalog"; board = $script:State.active_board; no = $null }
+        return
+    }
+    $prev = $script:HistoryStack[$script:HistoryStack.Count - 1]
+    $script:HistoryStack.RemoveAt($script:HistoryStack.Count - 1)
+    $script:State.active_board = $prev.board
+    Show-Header $script:State $script:HistoryStack.Count
+    if ($prev.type -eq "thread" -and $prev.no) {
+        $opened = Read-Thread -Board $prev.board -TargetInput $prev.no -CatalogCache @() -State $script:State
+        if ($null -ne $opened) {
+            $script:LastThread  = $opened
+            $script:CurrentView = $prev
+        }
+    } else {
+        $script:CatalogCache = Show-Catalog $prev.board
+        $script:CurrentView  = [PSCustomObject]@{ type = "catalog"; board = $prev.board; no = $null }
+    }
+}
+
+while ($true) {
+    $raw = Read-Host "nail[/$($State.active_board)/]>"
+    if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+    $tokens = $raw.Trim().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+    $cmd = $tokens[0].ToLower()
+
+    switch ($cmd) {
+        "clear" { Show-Header $State $HistoryStack.Count }
+        "boards" { Show-Boards $State }
+        "top" {
+            $ranked = Get-TopBoards $State 25
+            Write-Host "--------------------------------------------" -ForegroundColor DarkGray
+            Write-Host ("   {0,-18} {1,10}" -f "MOST VISITED", "VISITS") -ForegroundColor Gray
+            Write-Host "--------------------------------------------" -ForegroundColor DarkGray
+            foreach ($r in $ranked) {
+                $mark = if ($r.name -eq $State.active_board) { "*" } else { " " }
+                Write-Host (" {0} /{1,-16} {2,10}" -f $mark, "$($r.name)/", $r.hits) -ForegroundColor White
+            }
+            Write-Host "--------------------------------------------" -ForegroundColor DarkGray
+        }
+        { $_ -in @("index", "catalog") } {
+            $HistoryStack.Add($CurrentView)
+            $CatalogCache = Show-Catalog $State.active_board
+            $CurrentView  = [PSCustomObject]@{ type = "catalog"; board = $State.active_board; no = $null }
+        }
+        "tech" {
+            $HistoryStack.Add($CurrentView)
+            $State.active_board = $BaseBoard
+            Add-Visit $State $BaseBoard
+            Show-Header $State $HistoryStack.Count
+            $CatalogCache = Show-Catalog $BaseBoard
+            $CurrentView  = [PSCustomObject]@{ type = "catalog"; board = $BaseBoard; no = $null }
+        }
+        "mega" {
+            $HistoryStack.Add($CurrentView)
+            Add-Visit $State $BridgeBoard
+            if ($tokens.Count -ge 2) {
+                $opened = Read-Thread -Board $BridgeBoard -TargetInput $tokens[1] -CatalogCache @() -State $State
+                if ($null -ne $opened) {
+                    $LastThread  = $opened
+                    $CurrentView = [PSCustomObject]@{ type = "thread"; board = $BridgeBoard; no = $opened.no }
+                }
+            } else {
+                $CatalogCache = Show-Catalog $BridgeBoard
+                $CurrentView  = [PSCustomObject]@{ type = "catalog"; board = $BridgeBoard; no = $null }
+            }
+        }
+        "use" {
+            if ($tokens.Count -lt 2) {
+                Write-Host "[ERR] Usage: use <board>" -ForegroundColor DarkGray
+                continue
+            }
+            $HistoryStack.Add($CurrentView)
+            $target = ($tokens[1].Trim().ToLower()) -replace '^/|/$', ''
+            $State.active_board = $target
+            Add-Visit $State $target
+            Show-Header $State $HistoryStack.Count
+            $CatalogCache = Show-Catalog $target
+            $CurrentView  = [PSCustomObject]@{ type = "catalog"; board = $target; no = $null }
+        }
+        { $_ -in @("read", "open") } {
+            if ($tokens.Count -lt 2) {
+                Write-Host "[ERR] Usage: read <thread_no|idx>" -ForegroundColor DarkGray
+                continue
+            }
+            $targetBoard = if ($CurrentView.type -eq "catalog" -and $CurrentView.board) { $CurrentView.board } else { $State.active_board }
+            $opened = Read-Thread -Board $targetBoard -TargetInput $tokens[1] -CatalogCache $CatalogCache -State $State
+            if ($null -ne $opened) {
+                $HistoryStack.Add($CurrentView)
+                $LastThread  = $opened
+                $CurrentView = [PSCustomObject]@{ type = "thread"; board = $targetBoard; no = $opened.no }
+            }
+        }
+        { $_ -in @("reply", "post") } {
+            if ($CurrentView.type -ne "thread" -or -not $CurrentView.no) {
+                Write-Host "[ERR] Open a thread first with 'read <no|idx>' before replying." -ForegroundColor DarkGray
+                continue
+            }
+            if ($tokens.Count -lt 2) {
+                Write-Host "[ERR] Usage: reply <your message>" -ForegroundColor DarkGray
+                continue
+            }
+            $msg = ($tokens[1..($tokens.Count - 1)] -join " ").Trim()
+            $ok = Send-ThreadReply -Board $CurrentView.board -ThreadNo $CurrentView.no -CommentText $msg -State $State
+            if ($ok) {
+                Invoke-NavigateBack
+            }
+        }
+        { $_ -in @("back", "<<back", "<<") } {
+            Invoke-NavigateBack
+        }
+        "save" {
+            if ($null -eq $LastThread) {
+                Write-Host "[ERR] Open a thread first with 'read <no|idx>'." -ForegroundColor DarkGray
+                continue
+            }
+            if (-not (Test-Path $SaveDir)) { New-Item -ItemType Directory -Path $SaveDir | Out-Null }
+            $outFile = Join-Path $SaveDir "$($LastThread.board)_$($LastThread.no).md"
+            $lines = @("# /$($LastThread.board)/ Thread #$($LastThread.no)", "")
+            foreach ($p in $LastThread.posts) {
+                $name = if ($p.PSObject.Properties['name'] -and $p.name) { $p.name } else { "Anonymous" }
+                $lines += "### >>#$($p.no) — $name"
+                if ($p.PSObject.Properties['filename'] -and $p.filename) { $lines += "_Attachment: $($p.filename)$($p.ext)_" }
+                $lines += ""
+                $lines += (if ($p.PSObject.Properties['com']) { Clean-Html $p.com } else { "" })
+                $lines += "`n---`n"
+            }
+            $lines | Set-Content $outFile -Encoding UTF8
+            Write-Host "[SAVED] $outFile" -ForegroundColor White
+        }
+        "exit" { break }
+        default {
+            if ($cmd -match '^#?\d+$') {
+                $targetBoard = if ($CurrentView.type -eq "catalog" -and $CurrentView.board) { $CurrentView.board } else { $State.active_board }
+                $opened = Read-Thread -Board $targetBoard -TargetInput $cmd -CatalogCache $CatalogCache -State $State
+                if ($null -ne $opened) {
+                    $HistoryStack.Add($CurrentView)
+                    $LastThread  = $opened
+                    $CurrentView = [PSCustomObject]@{ type = "thread"; board = $targetBoard; no = $opened.no }
+                }
+            } else {
+                Write-Host "[ERR] Unknown command. Type: read <no|idx> | reply <msg> | <<back | mega [no] | tech | use <board> | boards | top | save | exit" -ForegroundColor DarkGray
+            }
+        }
+    }
+    if ($cmd -eq "exit") { break }
+}
+'@ | Set-Content -Path ".\dist\nail.ps1" -Encoding UTF8
+
+powershell -ExecutionPolicy Bypass -NoProfile -File ".\dist\nail.ps1"
